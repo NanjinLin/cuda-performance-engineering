@@ -297,6 +297,135 @@ ReductionRun run_chunked_hierarchical_reduction(const std::vector<float> &host_i
     return result;
 }
 
+void launch_atomic_reduction(
+    const float *device_input,
+    float *device_output,
+    int count)
+{
+    const int blocks = cuda_utils::ceil_div(count, kThreadsPerBlock);
+    reduce_sum_atomic_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, count);
+}
+
+const float *launch_shared_reduction(
+    const float *device_input,
+    float *scratch_a,
+    float *scratch_b,
+    int count)
+{
+    float *current_output = scratch_a;
+    while (count > 1)
+    {
+        const int blocks = cuda_utils::ceil_div(count, kThreadsPerBlock);
+        reduce_sum_shared_kernel<<<blocks, kThreadsPerBlock, kThreadsPerBlock * sizeof(float)>>>(device_input, current_output, count);
+        device_input = current_output;
+        count = blocks;
+        if (scratch_a == current_output)
+        {
+            current_output = scratch_b;
+        }
+        else
+        {
+            current_output = scratch_a;
+        }
+    }
+    return device_input;
+}
+
+const float *launch_warp_reduction(
+    const float *device_input,
+    float *scratch_a,
+    float *scratch_b,
+    int count)
+{
+    float *current_output = scratch_a;
+    while (count > 1)
+    {
+        const int blocks = cuda_utils::ceil_div(count, kThreadsPerBlock);
+        reduce_sum_warp_kernel<<<blocks, kThreadsPerBlock>>>(device_input, current_output, count);
+        device_input = current_output;
+        count = blocks;
+        if (scratch_a == current_output)
+        {
+            current_output = scratch_b;
+        }
+        else
+        {
+            current_output = scratch_a;
+        }
+    }
+    return device_input;
+}
+
+const float *launch_chunked_reduction(
+    const float *device_input,
+    float *scratch_a,
+    float *scratch_b,
+    int count)
+{
+    float *current_output = scratch_a;
+    while (count > 1)
+    {
+        const int blocks = cuda_utils::ceil_div(count, kThreadsPerBlock * kChunkItemsPerThread);
+        reduce_sum_chunked_kernel<<<blocks, kThreadsPerBlock, kThreadsPerBlock * sizeof(float)>>>(device_input, current_output, count);
+        device_input = current_output;
+        count = blocks;
+        if (scratch_a == current_output)
+        {
+            current_output = scratch_b;
+        }
+        else
+        {
+            current_output = scratch_a;
+        }
+    }
+    return device_input;
+}
+
+template <typename PrepareFunction, typename LaunchFunction>
+float benchmark_kernel(
+    PrepareFunction prepare,
+    LaunchFunction launch,
+    int num_warmups,
+    int num_trials)
+{
+    double total_ms = 0.0;
+
+    for (int i = 0; i < num_warmups; i++)
+    {
+        // 针对atomic的preprare
+        prepare();
+        launch();
+    }
+
+    CHECK_CUDA(cudaDeviceSynchronize());
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int trial = 0; trial < num_trials; trial++)
+    {
+        prepare();
+        CHECK_CUDA(cudaEventRecord(start));
+        launch();
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_LAST_CUDA_ERROR();
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(
+            &elapsed_ms,
+            start,
+            stop));
+        total_ms += elapsed_ms;
+    }
+
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return total_ms / num_trials;
+}
+
 int main()
 {
     // 故意不选 2 的整次幂，方便你观察:
@@ -365,6 +494,131 @@ int main()
     {
         std::cout << "chunked test passed.\n";
     }
+
+    // benckmark
+    constexpr int num_warmups = 5;
+    constexpr int num_trials = 20;
+
+    const size_t input_bytes = static_cast<size_t>(count) * sizeof(float);
+    const int max_partial_count =
+        cuda_utils::ceil_div(
+            count,
+            kThreadsPerBlock);
+    const size_t scratch_bytes =
+        static_cast<size_t>(max_partial_count) *
+        sizeof(float);
+
+    float *device_input = nullptr;
+    float *device_atomic_output = nullptr;
+    float *scratch_a = nullptr;
+    float *scratch_b = nullptr;
+
+    CHECK_CUDA(cudaMalloc(
+        &device_input,
+        input_bytes));
+
+    CHECK_CUDA(cudaMalloc(
+        &device_atomic_output,
+        sizeof(float)));
+
+    CHECK_CUDA(cudaMalloc(
+        &scratch_a,
+        scratch_bytes));
+
+    CHECK_CUDA(cudaMalloc(
+        &scratch_b,
+        scratch_bytes));
+
+    CHECK_CUDA(cudaMemcpy(
+        device_input,
+        host_input.data(),
+        input_bytes,
+        cudaMemcpyHostToDevice));
+
+    const float atomic_mean_ms =
+        benchmark_kernel(
+            [&]()
+            {
+                // 每次执行前清零，但不计入 kernel latency。
+                CHECK_CUDA(cudaMemset(
+                    device_atomic_output,
+                    0,
+                    sizeof(float)));
+            },
+            [&]()
+            {
+                launch_atomic_reduction(
+                    device_input,
+                    device_atomic_output,
+                    count);
+            },
+            num_warmups,
+            num_trials);
+
+    const float shared_mean_ms =
+        benchmark_kernel(
+            []()
+            {
+                // 不需要准备操作。
+            },
+            [&]()
+            {
+                // benchmark 不需要使用返回的结果指针。
+                (void)launch_shared_reduction(
+                    device_input,
+                    scratch_a,
+                    scratch_b,
+                    count);
+            },
+            num_warmups,
+            num_trials);
+
+    const float warp_mean_ms =
+        benchmark_kernel(
+            []() {},
+            [&]()
+            {
+                (void)launch_warp_reduction(
+                    device_input,
+                    scratch_a,
+                    scratch_b,
+                    count);
+            },
+            num_warmups,
+            num_trials);
+
+    const float chunked_mean_ms =
+        benchmark_kernel(
+            []() {},
+            [&]()
+            {
+                (void)launch_chunked_reduction(
+                    device_input,
+                    scratch_a,
+                    scratch_b,
+                    count);
+            },
+            num_warmups,
+            num_trials);
+
+    std::cout << "\nBenchmark results:\n";
+
+    std::cout << "atomic mean:  "
+              << atomic_mean_ms << " ms\n";
+
+    std::cout << "shared mean:  "
+              << shared_mean_ms << " ms\n";
+
+    std::cout << "warp mean:    "
+              << warp_mean_ms << " ms\n";
+
+    std::cout << "chunked mean: "
+              << chunked_mean_ms << " ms\n";
+
+    CHECK_CUDA(cudaFree(device_input));
+    CHECK_CUDA(cudaFree(device_atomic_output));
+    CHECK_CUDA(cudaFree(scratch_a));
+    CHECK_CUDA(cudaFree(scratch_b));
 
     return 0;
 }
