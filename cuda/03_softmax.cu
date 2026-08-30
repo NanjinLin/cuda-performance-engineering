@@ -170,16 +170,16 @@ __global__ void softmax_naive_kernel(
     {
         max_value = fmaxf(max_value, row_ptr[col]);
     }
-
-    double sum = 0.0;
+    // benchmark时改为float
+    float sum = 0.0f;
     for (int col = 0; col < cols; col++)
     {
-        sum += std::exp(static_cast<double>(row_ptr[col] - max_value));
+        sum += expf(row_ptr[col] - max_value);
     }
 
     for (int col = 0; col < cols; col++)
     {
-        out_ptr[col] = static_cast<float>(std::exp(static_cast<double>(row_ptr[col] - max_value)) / sum);
+        out_ptr[col] = expf(row_ptr[col] - max_value) / sum;
     }
 }
 
@@ -191,7 +191,7 @@ __global__ void softmax_online_kernel(
     int cols)
 {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row > rows)
+    if (row >= rows)
     {
         return;
     }
@@ -199,18 +199,19 @@ __global__ void softmax_online_kernel(
     float *out_ptr = output + row * cols;
 
     float row_max = kNegInf;
-    double row_sum = 0.0;
+    // benchmark时改为float
+    float row_sum = 0.0f;
     for (int col = 0; col < cols; col++)
     {
         const float x = row_ptr[col];
         const float new_row_max = fmaxf(row_max, x);
-        row_sum = row_sum * std::exp(static_cast<double>(row_max - new_row_max)) + std::exp(static_cast<double>(x - new_row_max));
+        row_sum = row_sum * expf(row_max - new_row_max) + expf(x - new_row_max);
         row_max = new_row_max;
     }
 
     for (int col = 0; col < cols; col++)
     {
-        out_ptr[col] = static_cast<float>(std::exp(static_cast<double>(row_ptr[col] - row_max)) / row_sum);
+        out_ptr[col] = expf(row_ptr[col] - row_max) / row_sum;
     }
 }
 
@@ -299,6 +300,146 @@ __global__ void softmax_causal_kernel(
             out_ptr[col] = static_cast<float>(
                 std::exp(static_cast<double>(row_ptr[col] - row_max)) / row_sum);
         }
+    }
+}
+
+// block
+__global__ void softmax_block_kernel(
+    const float *input,
+    float *output,
+    int rows,
+    int cols)
+{
+    __shared__ float shared_max[kThreadsPerBlock];
+    __shared__ float shared_sum[kThreadsPerBlock];
+
+    const int row = blockIdx.x;
+    if (row >= rows)
+    {
+        return;
+    }
+
+    const float *row_ptr = input + row * cols;
+    float *out_ptr = output + row * cols;
+
+    // 每个 thread 先扫自己负责的一部分列。
+    float local_max = kNegInf;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x)
+    {
+        local_max = fmaxf(local_max, row_ptr[col]);
+    }
+    shared_max[threadIdx.x] = local_max;
+    __syncthreads();
+
+    // 第一次规约: 找整行的最大值。
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+    {
+        if (threadIdx.x < offset)
+        {
+            shared_max[threadIdx.x] = fmaxf(shared_max[threadIdx.x], shared_max[threadIdx.x + offset]);
+        }
+        __syncthreads();
+    }
+
+    const float row_max = shared_max[0];
+
+    // 第二步: 每个 thread 计算自己负责位置的 exp sum 部分。
+    float local_sum = 0.0f;
+    for (int col = threadIdx.x; col < cols; col += blockDim.x)
+    {
+        local_sum += expf(row_ptr[col] - row_max);
+    }
+    shared_sum[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    // 第二次规约: 求整行的 sum。
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+    {
+        if (threadIdx.x < offset)
+        {
+            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + offset];
+        }
+        __syncthreads();
+    }
+
+    const float row_sum = shared_sum[0];
+
+    // 第三步: 归一化写回。
+    for (int col = threadIdx.x; col < cols; col += blockDim.x)
+    {
+        out_ptr[col] = expf(row_ptr[col] - row_max) / row_sum;
+    }
+}
+
+// block + online 理论性能王者
+__global__ void softmax_block_online_kernel(
+    const float *input,
+    float *output,
+    int rows,
+    int cols)
+{
+    __shared__ float shared_max[kThreadsPerBlock];
+    __shared__ float shared_sum[kThreadsPerBlock];
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row >= rows)
+    {
+        return;
+    }
+
+    const float *row_ptr = input + row * cols;
+    float *out_ptr = output + row * cols;
+
+    float local_max = kNegInf;
+    float local_sum = 0.0f;
+
+    // 每个线程遍历 col = tid, tid + blockDim.x, ...
+    // 使用 online 公式更新 local_max 和 local_sum。
+    for (int col = tid; col < cols; col += blockDim.x)
+    {
+        const float x = row_ptr[col];
+        const float new_local_max = fmaxf(local_max, x);
+        local_sum = local_sum * expf(local_max - new_local_max) + expf(x - new_local_max);
+        local_max = new_local_max;
+    }
+
+    shared_max[tid] = local_max;
+    shared_sum[tid] = local_sum;
+    __syncthreads();
+
+    // 对 (shared_max, shared_sum) 进行联合 reduction。
+    // 合并左右两个状态时使用上面的公式。
+    for (int offset = blockDim.x / 2; offset > 0; offset /= 2)
+    {
+        if (threadIdx.x < offset)
+        {
+            const float left_max = shared_max[tid];
+            const float left_sum = shared_sum[tid];
+
+            const float right_max = shared_max[tid + offset];
+            const float right_sum = shared_sum[tid + offset];
+
+            const float new_max = fmaxf(left_max, right_max);
+
+            const float new_sum =
+                left_sum * expf(left_max - new_max) +
+                right_sum * expf(right_max - new_max);
+
+            shared_max[tid] = new_max;
+            shared_sum[tid] = new_sum;
+        }
+        __syncthreads();
+    }
+
+    const float row_max = shared_max[0];
+    const float row_sum = shared_sum[0];
+
+    // 每个线程负责一部分列，完成归一化写回。
+    for (int col = tid; col < cols; col += blockDim.x)
+    {
+        out_ptr[col] = expf(row_ptr[col] - row_max) / row_sum;
     }
 }
 
@@ -446,6 +587,160 @@ void run_causal_softmax(
     CHECK_CUDA(cudaFree(device_output));
 }
 
+void run_block_softmax(
+    const std::vector<float> &host_input,
+    std::vector<float> &host_output,
+    int rows,
+    int cols)
+{
+    float *device_input = nullptr;
+    float *device_output = nullptr;
+    const size_t bytes = host_input.size() * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&device_input, bytes));
+    CHECK_CUDA(cudaMalloc(&device_output, bytes));
+    CHECK_CUDA(cudaMemcpy(device_input, host_input.data(), bytes, cudaMemcpyHostToDevice));
+
+    const int blocks = rows;
+    softmax_block_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+    CHECK_LAST_CUDA_ERROR();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(host_output.data(), device_output, bytes, cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(device_input));
+    CHECK_CUDA(cudaFree(device_output));
+
+    return;
+}
+
+void run_block_online_softmax(
+    const std::vector<float> &host_input,
+    std::vector<float> &host_output,
+    int rows,
+    int cols)
+{
+    float *device_input = nullptr;
+    float *device_output = nullptr;
+    const size_t bytes = host_input.size() * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&device_input, bytes));
+    CHECK_CUDA(cudaMalloc(&device_output, bytes));
+    CHECK_CUDA(cudaMemcpy(device_input, host_input.data(), bytes, cudaMemcpyHostToDevice));
+
+    const int blocks = rows;
+    softmax_block_online_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+    CHECK_LAST_CUDA_ERROR();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMemcpy(host_output.data(), device_output, bytes, cudaMemcpyDeviceToHost));
+
+    CHECK_CUDA(cudaFree(device_input));
+    CHECK_CUDA(cudaFree(device_output));
+
+    return;
+}
+
+void launch_naive_softmax(
+    const float *device_input,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = cuda_utils::ceil_div(rows, kThreadsPerBlock);
+    softmax_naive_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+}
+
+void launch_online_softmax(
+    const float *device_input,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = cuda_utils::ceil_div(rows, kThreadsPerBlock);
+    softmax_online_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+}
+
+void launch_masked_softmax(
+    const float *device_input,
+    const int *device_mask,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = cuda_utils::ceil_div(rows, kThreadsPerBlock);
+    softmax_masked_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_mask, device_output, rows, cols);
+}
+
+void launch_causal_softmax(
+    const float *device_input,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = cuda_utils::ceil_div(rows, kThreadsPerBlock);
+    softmax_causal_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+}
+
+void launch_block_softmax(
+    const float *device_input,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = rows;
+    softmax_block_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+}
+
+void launch_block_online_softmax(
+    const float *device_input,
+    float *device_output,
+    int rows,
+    int cols)
+{
+    const int blocks = rows;
+    softmax_block_online_kernel<<<blocks, kThreadsPerBlock>>>(device_input, device_output, rows, cols);
+}
+
+template <typename LaunchFunction, typename... Args>
+float benchmark_kernel(
+    LaunchFunction launch,
+    int num_warmups,
+    int num_trials,
+    Args... args)
+{
+    double total_ms = 0.0;
+
+    for (int i = 0; i < num_warmups; i++)
+    {
+        launch(args...);
+    }
+
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int i = 0; i < num_trials; i++)
+    {
+        CHECK_CUDA(cudaEventRecord(start));
+        launch(args...);
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(
+            &elapsed_ms,
+            start,
+            stop));
+        total_ms += elapsed_ms;
+    }
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    return total_ms / num_trials;
+}
+
 int main()
 {
     constexpr int rows = 64;
@@ -463,6 +758,8 @@ int main()
     std::vector<float> causal_input(causal_rows * causal_cols);
     std::vector<float> host_output_causal(causal_rows * causal_cols, 0.0f);
     std::vector<float> reference_causal(causal_rows * causal_cols, 0.0f);
+    std::vector<float> host_output_block(rows * cols, 0.0f);
+    std::vector<float> host_output_block_online(rows * cols, 0.0f);
 
     // Correctness
     fill_input(host_input, rows, cols);
@@ -476,11 +773,15 @@ int main()
     run_online_softmax(host_input, host_output_online, rows, cols);
     run_masked_softmax(host_input, host_mask, host_output_masked, rows, cols);
     run_causal_softmax(causal_input, host_output_causal, causal_rows, causal_cols);
+    run_block_softmax(host_input, host_output_block, rows, cols);
+    run_block_online_softmax(host_input, host_output_block_online, rows, cols);
 
     const bool naive_ok = check_output(host_output_naive, reference, rows, cols);
     const bool online_ok = check_output(host_output_online, reference, rows, cols);
     const bool masked_ok = check_output(host_output_masked, reference_masked, rows, cols);
     const bool causal_ok = check_output(host_output_causal, reference_causal, causal_rows, causal_cols);
+    const bool block_ok = check_output(host_output_block, reference, rows, cols);
+    const bool block_online_ok = check_output(host_output_block_online, reference, rows, cols);
 
     if (naive_ok)
     {
@@ -517,6 +818,48 @@ int main()
     {
         std::cout << "Causal softmax failed!" << "\n";
     }
+    if (block_ok)
+    {
+        std::cout << "block softmax passed!" << "\n";
+    }
+    else
+    {
+        std::cout << "block softmax failed!" << "\n";
+    }
+    if (block_online_ok)
+    {
+        std::cout << "block-online softmax passed!" << "\n";
+    }
+    else
+    {
+        std::cout << "block-online softmax failed!" << "\n";
+    }
+
+    // benchmarking
+    constexpr int num_warmups = 20;
+    constexpr int num_trials = 200;
+    float *device_input = nullptr;
+    float *device_output = nullptr;
+    constexpr int benchmark_rows = 16384;
+    constexpr int benchmark_cols = 257;
+
+    const size_t input_bytes = static_cast<size_t>(benchmark_rows * benchmark_cols) * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&device_input, input_bytes));
+    CHECK_CUDA(cudaMalloc(&device_output, input_bytes));
+
+    float naive_softmax_ms = benchmark_kernel(launch_naive_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
+    float online_softmax_ms = benchmark_kernel(launch_online_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
+    float block_softmax_ms = benchmark_kernel(launch_block_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
+    float block_online_softmax_ms = benchmark_kernel(launch_block_online_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
+
+    CHECK_CUDA(cudaFree(device_input));
+    CHECK_CUDA(cudaFree(device_output));
+
+    std::cout << "naive softmax: " << naive_softmax_ms << " ms" << "\n";
+    std::cout << "online softmax: " << online_softmax_ms << " ms" << "\n";
+    std::cout << "block softmax: " << block_softmax_ms << " ms" << "\n";
+    std::cout << "block-online softmax: " << block_online_softmax_ms << " ms" << "\n";
 
     return 0;
 }
