@@ -296,7 +296,7 @@ void fill_inputs(std::vector<float> &a, std::vector<float> &b, int m, int n, int
 {
     for (int row = 0; row < m; row++)
     {
-        for (int col = 0; col < n; col++)
+        for (int col = 0; col < k; col++)
         {
             a[row * k + col] = static_cast<float>((row + col) % 41);
         }
@@ -473,8 +473,97 @@ void run_register_blocked_matmul(
     CHECK_CUDA(cudaFree(device_c));
 }
 
+void launch_naive(
+    const float *device_a,
+    const float *device_b,
+    float *device_c,
+    int m, int n, int k)
+{
+    constexpr int kBlockX = 16;
+    constexpr int kBlockY = 16;
+    const dim3 block(kBlockX, kBlockY);
+    const dim3 grid(
+        cuda_utils::ceil_div(n, kBlockX),
+        cuda_utils::ceil_div(m, kBlockY));
+    matmul_naive_kernel<<<grid, block>>>(device_a, device_b, device_c, m, n, k);
+}
+
+void launch_tiled_kernel(
+    const float *device_a,
+    const float *device_b,
+    float *device_c,
+    int m, int n, int k)
+{
+    const dim3 block(kTile, kTile);
+    const dim3 grid(cuda_utils::ceil_div(n, kTile), cuda_utils::ceil_div(m, kTile));
+    matmul_tiled_kernel<<<grid, block>>>(device_a, device_b, device_c, m, n, k);
+}
+
+void launch_warp_tiled_kernel(
+    const float *device_a,
+    const float *device_b,
+    float *device_c,
+    int m, int n, int k)
+{
+    const dim3 block(kWarpSize, kWarpsPerBlock);
+    const dim3 grid(cuda_utils::ceil_div(n, kBlockTileN), cuda_utils::ceil_div(m, kBlockTileM));
+    matmul_warp_tiled_kernel<<<grid, block>>>(device_a, device_b, device_c, m, n, k);
+}
+void launch_register_blocked_kernel(
+    const float *device_a,
+    const float *device_b,
+    float *device_c,
+    int m, int n, int k)
+{
+    const dim3 block(kRegBlockThreadsX, kRegBlockThreadsY);
+    const dim3 grid(
+        cuda_utils::ceil_div(n, kRegBlockTileN),
+        cuda_utils::ceil_div(m, kRegBlockTileM));
+    matmul_register_blocked_kernel<<<grid, block>>>(device_a, device_b, device_c, m, n, k);
+}
+
+template <typename LaunchFunction>
+float benchmark(
+    LaunchFunction launch,
+    int num_warmups,
+    int num_trials,
+    const float *device_a,
+    const float *device_b,
+    float *device_c,
+    int m, int n, int k)
+{
+    float total_ms = 0.0f;
+
+    for (int i = 0; i < num_warmups; i++)
+    {
+        launch(device_a, device_b, device_c, m, n, k);
+    }
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    for (int i = 0; i < num_trials; i++)
+    {
+        CHECK_CUDA(cudaEventRecord(start));
+        launch(device_a, device_b, device_c, m, n, k);
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+        float elapsed_ms = 0.0f;
+        CHECK_CUDA(cudaEventElapsedTime(
+            &elapsed_ms, start, stop));
+        total_ms += elapsed_ms;
+    }
+
+    return total_ms / num_trials;
+}
+
 int main()
 {
+
     constexpr int m = 64;
     constexpr int n = 64;
     constexpr int k = 64;
@@ -540,6 +629,46 @@ int main()
     {
         std::cout << "register failed" << "\n";
     }
+
+    // benchmark
+    constexpr int num_warmups = 20;
+    constexpr int num_trials = 200;
+    float *device_a = nullptr;
+    float *device_b = nullptr;
+    float *device_c = nullptr;
+    const int benchmark_m = 1024;
+    const int benchmark_n = 1024;
+    const int benchmark_k = 1024;
+
+    const size_t a_size = static_cast<size_t>(benchmark_m * benchmark_k) * sizeof(float);
+    const size_t b_size = static_cast<size_t>(benchmark_k * benchmark_n) * sizeof(float);
+    const size_t c_size = static_cast<size_t>(benchmark_m * benchmark_n) * sizeof(float);
+
+    CHECK_CUDA(cudaMalloc(&device_a, a_size));
+    CHECK_CUDA(cudaMalloc(&device_b, b_size));
+    CHECK_CUDA(cudaMalloc(&device_c, c_size));
+
+    std::vector<float> benchmark_a(benchmark_m * benchmark_k);
+    std::vector<float> benchmark_b(benchmark_k * benchmark_n);
+
+    fill_inputs(benchmark_a, benchmark_b, benchmark_m, benchmark_n, benchmark_k);
+
+    CHECK_CUDA(cudaMemcpy(device_a, benchmark_a.data(), a_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(device_b, benchmark_b.data(), b_size, cudaMemcpyHostToDevice));
+
+    float naive_ms = benchmark(launch_naive, num_warmups, num_trials, device_a, device_b, device_c, benchmark_m, benchmark_n, benchmark_k);
+    float tiled_ms = benchmark(launch_tiled_kernel, num_warmups, num_trials, device_a, device_b, device_c, benchmark_m, benchmark_n, benchmark_k);
+    float warp_ms = benchmark(launch_warp_tiled_kernel, num_warmups, num_trials, device_a, device_b, device_c, benchmark_m, benchmark_n, benchmark_k);
+    float register_ms = benchmark(launch_register_blocked_kernel, num_warmups, num_trials, device_a, device_b, device_c, benchmark_m, benchmark_n, benchmark_k);
+
+    CHECK_CUDA(cudaFree(device_a));
+    CHECK_CUDA(cudaFree(device_b));
+    CHECK_CUDA(cudaFree(device_c));
+
+    std::cout << "naive_ms: " << naive_ms << " ms" << "\n";
+    std::cout << "tiled_ms: " << tiled_ms << " ms" << "\n";
+    std::cout << "warp_ms: " << warp_ms << " ms" << "\n";
+    std::cout << "register_ms: " << register_ms << " ms" << "\n";
 
     return 0;
 }

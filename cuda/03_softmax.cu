@@ -845,8 +845,21 @@ int main()
 
     const size_t input_bytes = static_cast<size_t>(benchmark_rows * benchmark_cols) * sizeof(float);
 
+    std::vector<float> benchmark_input(benchmark_rows * benchmark_cols);
+
+    fill_input(
+        benchmark_input,
+        benchmark_rows,
+        benchmark_cols);
+
     CHECK_CUDA(cudaMalloc(&device_input, input_bytes));
     CHECK_CUDA(cudaMalloc(&device_output, input_bytes));
+
+    CHECK_CUDA(cudaMemcpy(
+        device_input,
+        benchmark_input.data(),
+        input_bytes,
+        cudaMemcpyHostToDevice));
 
     float naive_softmax_ms = benchmark_kernel(launch_naive_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
     float online_softmax_ms = benchmark_kernel(launch_online_softmax, num_warmups, num_trials, device_input, device_output, benchmark_rows, benchmark_cols);
