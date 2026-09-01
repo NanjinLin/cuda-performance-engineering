@@ -558,6 +558,9 @@ float benchmark(
         total_ms += elapsed_ms;
     }
 
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
     return total_ms / num_trials;
 }
 
