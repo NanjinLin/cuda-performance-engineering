@@ -43,7 +43,7 @@ void softmax_cpu(
     }
 }
 
-void softmax_onlie_cpu(
+void softmax_online_cpu(
     const std::vector<float> &input,
     std::vector<float> &output,
     int rows,
@@ -371,7 +371,7 @@ __global__ void softmax_block_kernel(
     }
 }
 
-// block + online 理论性能王者
+// block + online
 __global__ void softmax_block_online_kernel(
     const float *input,
     float *output,
